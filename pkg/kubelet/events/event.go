@@ -66,6 +66,7 @@ const (
 	SuccessfulMountVolume                = "SuccessfulMountVolume"
 	NodeRebooted                         = "Rebooted"
 	NodeShutdown                         = "Shutdown"
+	NodeShutdownInhibitor                = "ShutdownInhibitor"
 	ContainerGCFailed                    = "ContainerGCFailed"
 	ImageGCFailed                        = "ImageGCFailed"
 	FailedNodeAllocatableEnforcement     = "FailedNodeAllocatableEnforcement"

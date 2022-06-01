@@ -804,3 +804,51 @@ func VolumeLimits(volumePluginListFunc func() []volume.VolumePluginWithAttachLim
 		return nil
 	}
 }
+
+// RebootInhibited returns a Setter that updates the v1.RebootInhibited condition on the node.
+func RebootInhibited(nowFunc func() time.Time, // typically Kubelet.clock.Now
+	inhibitedFunc func() error, // typically Kubelet.shutdownManager.IsRebootInhibited
+	recordEventFunc func(eventType, event string), // typically Kubelet.recordNodeStatusEvent
+) Setter {
+	return func(node *v1.Node) error {
+		currentTime := metav1.NewTime(nowFunc())
+		var condition *v1.NodeCondition
+
+		for i := range node.Status.Conditions {
+			//TODO temp stuff until commit is done to api
+			if node.Status.Conditions[i].Type == "ShutdownInhibited" {
+				condition = &node.Status.Conditions[i]
+			}
+		}
+
+		newCondition := false
+		if condition == nil {
+			condition = &v1.NodeCondition{
+				Type:   "ShutdownInhibited",
+				Status: v1.ConditionUnknown,
+			}
+			newCondition = true
+		}
+
+		condition.LastHeartbeatTime = currentTime
+
+		if err := inhibitedFunc(); err != nil{
+			condition.Status = v1.ConditionTrue
+			condition.Reason = err.Error()
+			condition.Message = "kubelet inhibited node shutdown"
+			condition.LastTransitionTime = currentTime
+			recordEventFunc(v1.EventTypeNormal, "NodeShutdownInhibited")
+		} else if condition.Status != v1.ConditionFalse {
+			condition.Status = v1.ConditionFalse
+			condition.Reason = "KubeletShutdownAllowed"
+			condition.Message = "kubelet allows node shutdown"
+			condition.LastTransitionTime = currentTime
+			recordEventFunc(v1.EventTypeNormal, "NodeShutdownAllowed")
+		}
+
+		if newCondition {
+			node.Status.Conditions = append(node.Status.Conditions, *condition)
+		}
+		return nil
+	}
+}

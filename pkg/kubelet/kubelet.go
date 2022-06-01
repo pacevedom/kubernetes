@@ -876,6 +876,9 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		ShutdownGracePeriodRequested:     kubeCfg.ShutdownGracePeriod.Duration,
 		ShutdownGracePeriodCriticalPods:  kubeCfg.ShutdownGracePeriodCriticalPods.Duration,
 		ShutdownGracePeriodByPodPriority: kubeCfg.ShutdownGracePeriodByPodPriority,
+		ShutdownInhibitorAlertTimeout:    kubeCfg.ShutdownInhibitorAlertTimeout.Duration,
+		NodeLister:                       nodeLister,
+		InformerFactory:                  informers.NewSharedInformerFactory(kubeDeps.KubeClient, 0),
 	})
 	klet.shutdownManager = shutdownManager
 	klet.admitHandlers.AddPodAdmitHandler(shutdownAdmitHandler)

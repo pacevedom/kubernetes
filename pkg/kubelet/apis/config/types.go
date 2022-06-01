@@ -444,6 +444,11 @@ type KubeletConfiguration struct {
 	// registerNode enables automatic registration with the apiserver.
 	// +optional
 	RegisterNode bool
+
+	// ShutdownInhibitorAlertTimeout TODO
+	// +featureGate=ShutdownInhibitor
+	// +optional
+	ShutdownInhibitorAlertTimeout metav1.Duration
 }
 
 // KubeletAuthorizationMode denotes the authorization mode for the kubelet

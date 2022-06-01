@@ -855,6 +855,12 @@ const (
 	//
 	// Enables GRPC probe method for {Liveness,Readiness,Startup}Probe.
 	GRPCContainerProbe featuregate.Feature = "GRPCContainerProbe"
+
+	// owner: @pacevedom
+	// alpha: v1.25
+	// beta:  v1.26
+	// Adds support for kubelet to block shutdown in a node
+	ShutdownInhibitor featuregate.Feature = "ShutdownInhibitor"
 )
 
 func init() {
@@ -940,6 +946,7 @@ var defaultKubernetesFeatureGates = map[featuregate.Feature]featuregate.FeatureS
 	KubeletCredentialProviders:                     {Default: false, PreRelease: featuregate.Alpha},
 	GracefulNodeShutdown:                           {Default: true, PreRelease: featuregate.Beta},
 	GracefulNodeShutdownBasedOnPodPriority:         {Default: false, PreRelease: featuregate.Alpha},
+	ShutdownInhibitor:                              {Default: false, PreRelease: featuregate.Alpha},
 	ServiceLBNodePortControl:                       {Default: true, PreRelease: featuregate.Beta},
 	MixedProtocolLBService:                         {Default: false, PreRelease: featuregate.Alpha},
 	VolumeCapacityPriority:                         {Default: false, PreRelease: featuregate.Alpha},

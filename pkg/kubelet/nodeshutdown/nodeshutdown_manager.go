@@ -20,6 +20,8 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/record"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
@@ -33,6 +35,7 @@ type Manager interface {
 	Admit(attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult
 	Start() error
 	ShutdownStatus() error
+	ShutdownInhibited() error
 }
 
 // Config represents Manager configuration
@@ -46,7 +49,10 @@ type Config struct {
 	ShutdownGracePeriodRequested     time.Duration
 	ShutdownGracePeriodCriticalPods  time.Duration
 	ShutdownGracePeriodByPodPriority []kubeletconfig.ShutdownGracePeriodByPodPriority
+	ShutdownInhibitorAlertTimeout    time.Duration
+	NodeLister                       corelisters.NodeLister
 	Clock                            clock.Clock
+	InformerFactory                  informers.SharedInformerFactory
 }
 
 // managerStub is a fake node shutdown managerImpl .
@@ -64,5 +70,10 @@ func (managerStub) Start() error {
 
 // ShutdownStatus is a no-op always returning nil for non linux platforms.
 func (managerStub) ShutdownStatus() error {
+	return nil
+}
+
+// ShutdownManager is a no-op always returning nil for non linux platforms.
+func (managerStub) ShutdownInhibited() error {
 	return nil
 }

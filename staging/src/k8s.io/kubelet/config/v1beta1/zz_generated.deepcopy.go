@@ -362,6 +362,7 @@ func (in *KubeletConfiguration) DeepCopyInto(out *KubeletConfiguration) {
 		*out = new(bool)
 		**out = **in
 	}
+	out.ShutdownInhibitorAlertTimeout = in.ShutdownInhibitorAlertTimeout
 	return
 }
 

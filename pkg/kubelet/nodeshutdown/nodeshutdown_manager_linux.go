@@ -23,11 +23,17 @@ package nodeshutdown
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/informers"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/apis/scheduling"
@@ -47,6 +53,7 @@ const (
 	nodeShutdownNotAdmittedReason  = "NodeShutdown"
 	nodeShutdownNotAdmittedMessage = "Pod was rejected as the node is shutting down."
 	dbusReconnectPeriod            = 1 * time.Second
+	shutdownAllowedNamespaces      = "k8s.io/shutdownallowed"
 )
 
 var systemDbus = func() (dbusInhibiter, error) {
@@ -56,6 +63,7 @@ var systemDbus = func() (dbusInhibiter, error) {
 type dbusInhibiter interface {
 	CurrentInhibitDelay() (time.Duration, error)
 	InhibitShutdown() (systemd.InhibitLock, error)
+	BlockShutdown() (systemd.InhibitLock, error)
 	ReleaseInhibitLock(lock systemd.InhibitLock) error
 	ReloadLogindConf() error
 	MonitorShutdown() (<-chan bool, error)
@@ -77,36 +85,54 @@ type managerImpl struct {
 	dbusCon     dbusInhibiter
 	inhibitLock systemd.InhibitLock
 
+	shutdownInhibitorAlertTimeLimit time.Duration
+	shutdownInhibitorHolders        map[string]*time.Timer
+	shutdownInhibitorHolderID       string
+	shutdownInhibitorMutex          sync.Mutex
+
 	nodeShuttingDownMutex sync.Mutex
 	nodeShuttingDownNow   bool
 
-	clock clock.Clock
+	nodeLister corelisters.NodeLister
+
+	clock           clock.Clock
+	informerFactory informers.SharedInformerFactory
+	leaseInformer   cache.SharedIndexInformer
 }
 
 // NewManager returns a new node shutdown manager.
 func NewManager(conf *Config) (Manager, lifecycle.PodAdmitHandler) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.GracefulNodeShutdown) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.GracefulNodeShutdown) &&
+		!utilfeature.DefaultFeatureGate.Enabled(features.ShutdownInhibitor) {
 		m := managerStub{}
 		return m, m
 	}
 
-	shutdownGracePeriodByPodPriority := conf.ShutdownGracePeriodByPodPriority
-	// Migration from the original configuration
-	if !utilfeature.DefaultFeatureGate.Enabled(features.GracefulNodeShutdownBasedOnPodPriority) ||
-		len(shutdownGracePeriodByPodPriority) == 0 {
-		shutdownGracePeriodByPodPriority = migrateConfig(conf.ShutdownGracePeriodRequested, conf.ShutdownGracePeriodCriticalPods)
+	var shutdownGracePeriodByPodPriority []kubeletconfig.ShutdownGracePeriodByPodPriority
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.GracefulNodeShutdown) {
+		shutdownGracePeriodByPodPriority = conf.ShutdownGracePeriodByPodPriority
+		// Migration from the original configuration
+		if !utilfeature.DefaultFeatureGate.Enabled(features.GracefulNodeShutdownBasedOnPodPriority) ||
+			len(shutdownGracePeriodByPodPriority) == 0 {
+			shutdownGracePeriodByPodPriority = migrateConfig(conf.ShutdownGracePeriodRequested, conf.ShutdownGracePeriodCriticalPods)
+		}
+
+		// Sort by priority from low to high
+		sort.Slice(shutdownGracePeriodByPodPriority, func(i, j int) bool {
+			return shutdownGracePeriodByPodPriority[i].Priority < shutdownGracePeriodByPodPriority[j].Priority
+		})
 	}
 
-	// Disable if the configuration is empty
-	if len(shutdownGracePeriodByPodPriority) == 0 {
-		m := managerStub{}
-		return m, m
-	}
+	var shutdownInhibitorAlertTimeLimit time.Duration
+	var informerFactory informers.SharedInformerFactory
+	var leaseInformer cache.SharedIndexInformer
 
-	// Sort by priority from low to high
-	sort.Slice(shutdownGracePeriodByPodPriority, func(i, j int) bool {
-		return shutdownGracePeriodByPodPriority[i].Priority < shutdownGracePeriodByPodPriority[j].Priority
-	})
+	if utilfeature.DefaultFeatureGate.Enabled(features.ShutdownInhibitor) {
+		shutdownInhibitorAlertTimeLimit = conf.ShutdownInhibitorAlertTimeout
+		informerFactory = conf.InformerFactory
+		leaseInformer = conf.InformerFactory.Coordination().V1().Leases().Informer()
+	}
 
 	if conf.Clock == nil {
 		conf.Clock = clock.RealClock{}
@@ -119,13 +145,21 @@ func NewManager(conf *Config) (Manager, lifecycle.PodAdmitHandler) {
 		killPodFunc:                      conf.KillPodFunc,
 		syncNodeStatus:                   conf.SyncNodeStatusFunc,
 		shutdownGracePeriodByPodPriority: shutdownGracePeriodByPodPriority,
+		shutdownInhibitorAlertTimeLimit:  shutdownInhibitorAlertTimeLimit,
+		shutdownInhibitorHolders:         make(map[string]*time.Timer),
+		nodeLister:                       conf.NodeLister,
 		clock:                            conf.Clock,
+		informerFactory:                  informerFactory,
+		leaseInformer:                    leaseInformer,
 	}
+
 	klog.InfoS("Creating node shutdown manager",
 		"shutdownGracePeriodRequested", conf.ShutdownGracePeriodRequested,
 		"shutdownGracePeriodCriticalPods", conf.ShutdownGracePeriodCriticalPods,
 		"shutdownGracePeriodByPodPriority", shutdownGracePeriodByPodPriority,
+		"shutdownInhibitorAlertTimeout", conf.ShutdownInhibitorAlertTimeout,
 	)
+
 	return manager, manager
 }
 
@@ -149,6 +183,9 @@ func (m *managerImpl) Start() error {
 	if err != nil {
 		return err
 	}
+	if m.shutdownGracePeriodByPodPriority == nil {
+		return nil
+	}
 	go func() {
 		for {
 			if stop != nil {
@@ -167,11 +204,30 @@ func (m *managerImpl) Start() error {
 }
 
 func (m *managerImpl) start() (chan struct{}, error) {
+	if len(m.shutdownGracePeriodByPodPriority) == 0 && m.shutdownInhibitorAlertTimeLimit == 0 {
+		return nil, nil
+	}
+
 	systemBus, err := systemDbus()
 	if err != nil {
 		return nil, err
 	}
 	m.dbusCon = systemBus
+
+	if m.shutdownInhibitorAlertTimeLimit != 0 {
+		m.leaseInformer.AddEventHandler(
+			cache.ResourceEventHandlerFuncs{
+				AddFunc:    m.leaseAdd,
+				UpdateFunc: m.leaseUpdate,
+				DeleteFunc: m.leaseDelete,
+			},
+		)
+		m.informerFactory.Start(wait.NeverStop)
+	}
+
+	if len(m.shutdownGracePeriodByPodPriority) == 0 {
+		return nil, nil
+	}
 
 	currentInhibitDelay, err := m.dbusCon.CurrentInhibitDelay()
 	if err != nil {
@@ -217,10 +273,6 @@ func (m *managerImpl) start() (chan struct{}, error) {
 
 	stop := make(chan struct{})
 	go func() {
-		// Monitor for shutdown events. This follows the logind Inhibit Delay pattern described on https://www.freedesktop.org/wiki/Software/systemd/inhibit/
-		// 1. When shutdown manager starts, an inhibit lock is taken.
-		// 2. When shutdown(true) event is received, process the shutdown and release the inhibit lock.
-		// 3. When shutdown(false) event is received, this indicates a previous shutdown was cancelled. In this case, acquire the inhibit lock again.
 		for {
 			select {
 			case isShuttingDown, ok := <-events:
@@ -238,6 +290,7 @@ func (m *managerImpl) start() (chan struct{}, error) {
 					shutdownType = "cancelled"
 				}
 				klog.V(1).InfoS("Shutdown manager detected new shutdown event", "event", shutdownType)
+
 				if isShuttingDown {
 					m.recorder.Event(m.nodeRef, v1.EventTypeNormal, kubeletevents.NodeShutdown, "Shutdown manager detected shutdown event")
 				} else {
@@ -251,7 +304,6 @@ func (m *managerImpl) start() (chan struct{}, error) {
 				if isShuttingDown {
 					// Update node status and ready condition
 					go m.syncNodeStatus()
-
 					m.processShutdownEvent()
 				} else {
 					m.aquireInhibitLock()
@@ -267,11 +319,26 @@ func (m *managerImpl) aquireInhibitLock() error {
 	if err != nil {
 		return err
 	}
-	if m.inhibitLock != 0 {
-		m.dbusCon.ReleaseInhibitLock(m.inhibitLock)
-	}
+	m.releaseInhibitLock()
 	m.inhibitLock = lock
 	return nil
+}
+
+func (m *managerImpl) acquireBlockLock() error {
+	lock, err := m.dbusCon.BlockShutdown()
+	if err != nil {
+		return err
+	}
+	m.releaseInhibitLock()
+	m.inhibitLock = lock
+	return nil
+}
+
+func (m *managerImpl) releaseInhibitLock() {
+	if m.inhibitLock != 0 {
+		m.dbusCon.ReleaseInhibitLock(m.inhibitLock)
+		m.inhibitLock = 0
+	}
 }
 
 // ShutdownStatus will return an error if the node is currently shutting down.
@@ -281,6 +348,16 @@ func (m *managerImpl) ShutdownStatus() error {
 
 	if m.nodeShuttingDownNow {
 		return fmt.Errorf("node is shutting down")
+	}
+	return nil
+}
+
+// ShutdownInhibited will return true if the node is currently unable to reboot
+func (m *managerImpl) ShutdownInhibited() error {
+	m.shutdownInhibitorMutex.Lock()
+	defer m.shutdownInhibitorMutex.Unlock()
+	if len(m.shutdownInhibitorHolders) > 0 {
+		return fmt.Errorf("%s", m.shutdownInhibitorHolderID)
 	}
 	return nil
 }
@@ -357,6 +434,130 @@ func (m *managerImpl) periodRequested() time.Duration {
 	return time.Duration(sum) * time.Second
 }
 
+func (m *managerImpl) leaseAdd(obj interface{}) {
+	if m.ShutdownStatus() != nil {
+		klog.Info("shutdown inhibitor: ignored, node is shutting down")
+		return
+	}
+	newLease := obj.(*coordinationv1.Lease)
+	if newLease.Spec.HolderIdentity == nil || *newLease.Spec.HolderIdentity == "" ||
+		newLease.Spec.AcquireTime == nil || newLease.Spec.AcquireTime.IsZero() ||
+		newLease.Name != m.nodeRef.Name || newLease.Namespace == v1.NamespaceNodeLease ||
+		!m.isNamespaceAllowed(newLease.Namespace) {
+		return
+	}
+	m.addBlockHolder(holderIdentityUniqueName(newLease.Namespace, *newLease.Spec.HolderIdentity))
+}
+
+func (m *managerImpl) leaseUpdate(old, new interface{}) {
+	if m.ShutdownStatus() != nil {
+		klog.Info("shutdown inhibitor: ignored, node is shutting down")
+		return
+	}
+
+	oldLease := old.(*coordinationv1.Lease)
+	newLease := new.(*coordinationv1.Lease)
+	if newLease.Name != m.nodeRef.Name || newLease.Namespace == v1.NamespaceNodeLease {
+		return
+	}
+	if newLease.Spec.HolderIdentity != nil && oldLease.Spec.HolderIdentity != nil {
+		if *newLease.Spec.HolderIdentity == "" && *newLease.Spec.HolderIdentity != *oldLease.Spec.HolderIdentity {
+			m.removeBlockHolder(holderIdentityUniqueName(oldLease.Namespace, *oldLease.Spec.HolderIdentity))
+		} else {
+			if !m.isNamespaceAllowed(newLease.Namespace) {
+				return
+			}
+			m.addBlockHolder(holderIdentityUniqueName(newLease.Namespace, *newLease.Spec.HolderIdentity))
+		}
+	}
+}
+
+func (m *managerImpl) leaseDelete(obj interface{}) {
+	deletedLease := obj.(*coordinationv1.Lease)
+	if deletedLease.Spec.HolderIdentity == nil || *deletedLease.Spec.HolderIdentity == "" ||
+		deletedLease.Name != m.nodeRef.Name || deletedLease.Namespace == v1.NamespaceNodeLease {
+		return
+	}
+	m.removeBlockHolder(holderIdentityUniqueName(deletedLease.Namespace, *deletedLease.Spec.HolderIdentity))
+}
+
+func (m *managerImpl) addBlockHolder(id string) {
+	m.shutdownInhibitorMutex.Lock()
+	defer m.shutdownInhibitorMutex.Unlock()
+
+	if len(m.shutdownInhibitorHolders) == 0 {
+		if err := m.acquireBlockLock(); err != nil {
+			klog.ErrorS(err, "unable to create shutdown block inhibitor", "holderIdentity", id)
+			return
+		}
+		m.shutdownInhibitorHolders[id] = time.AfterFunc(m.shutdownInhibitorAlertTimeLimit, func() {
+			klog.InfoS("shutdown inhibitor: lease been held for too long", "holder", id)
+			m.recorder.Event(m.nodeRef, v1.EventTypeWarning, kubeletevents.NodeShutdownInhibitor, fmt.Sprintf("Shutdown lease held for too long: %s", id))
+		})
+		m.shutdownInhibitorHolderID = id
+		m.recorder.Event(m.nodeRef, v1.EventTypeNormal, kubeletevents.NodeShutdownInhibitor, "Shutdown inhibitor has been created")
+		klog.InfoS("shutdown inhibitor: block acquired", "holder", m.shutdownInhibitorHolderID)
+	} else {
+		if _, ok := m.shutdownInhibitorHolders[id]; !ok {
+			m.shutdownInhibitorHolders[id] = nil
+			klog.InfoS("shutdown inhibitor: lease added to waiting list", "holder", id)
+		}
+	}
+}
+
+func (m *managerImpl) removeBlockHolder(id string) {
+	m.shutdownInhibitorMutex.Lock()
+	defer m.shutdownInhibitorMutex.Unlock()
+	if len(m.shutdownInhibitorHolders) == 0 {
+		return
+	}
+
+	if t, ok := m.shutdownInhibitorHolders[id]; ok && t != nil {
+		t.Stop()
+	}
+	delete(m.shutdownInhibitorHolders, id)
+	if len(m.shutdownInhibitorHolders) > 0 {
+		nextID := ""
+		for h := range m.shutdownInhibitorHolders {
+			nextID = h
+			break
+		}
+		m.shutdownInhibitorHolderID = nextID
+		m.shutdownInhibitorHolders[nextID] = time.AfterFunc(m.shutdownInhibitorAlertTimeLimit, func() {
+			klog.InfoS("shutdown inhibitor: lease been held for too long", "holder", nextID)
+			m.recorder.Event(m.nodeRef, v1.EventTypeWarning, kubeletevents.NodeShutdownInhibitor, fmt.Sprintf("Shutdown lease held for too long: %s", nextID))
+		})
+		m.recorder.Event(m.nodeRef, v1.EventTypeNormal, kubeletevents.NodeShutdownInhibitor, fmt.Sprintf("Shutdown inhibitor new owner: %s", m.shutdownInhibitorHolderID))
+		klog.InfoS("shutdown inhibitor: lease new owner", "holder", m.shutdownInhibitorHolderID)
+	} else {
+		m.shutdownInhibitorHolderID = ""
+		if len(m.shutdownGracePeriodByPodPriority) > 0 {
+			if err := m.aquireInhibitLock(); err != nil {
+				klog.ErrorS(err, "unable to acquire shutdown delay inhibitor")
+				return
+			}
+		} else {
+			m.releaseInhibitLock()
+		}
+		m.recorder.Event(m.nodeRef, v1.EventTypeNormal, kubeletevents.NodeShutdownInhibitor, "Shutdown inhibitor removed")
+		klog.InfoS("shutdown inhibitor: all leases released, block removed")
+	}
+}
+
+func (m *managerImpl) isNamespaceAllowed(namespace string) bool {
+	node, err := m.nodeLister.Get(m.nodeRef.Name)
+	if err != nil {
+		klog.ErrorS(err, "unable to get node", "node", m.nodeRef.Name)
+		return false
+	}
+	if allowedNamespaces, ok := node.Annotations[shutdownAllowedNamespaces]; ok {
+		if strings.Contains(allowedNamespaces, namespace) {
+			return true
+		}
+	}
+	return false
+}
+
 func migrateConfig(shutdownGracePeriodRequested, shutdownGracePeriodCriticalPods time.Duration) []kubeletconfig.ShutdownGracePeriodByPodPriority {
 	if shutdownGracePeriodRequested == 0 {
 		return nil
@@ -422,4 +623,8 @@ func groupByPriority(shutdownGracePeriodByPodPriority []kubeletconfig.ShutdownGr
 type podShutdownGroup struct {
 	kubeletconfig.ShutdownGracePeriodByPodPriority
 	Pods []*v1.Pod
+}
+
+func holderIdentityUniqueName(namespace, holder string) string {
+	return fmt.Sprintf("%s/%s", namespace, holder)
 }

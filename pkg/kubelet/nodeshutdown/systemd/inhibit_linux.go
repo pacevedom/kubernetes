@@ -104,6 +104,27 @@ func (bus *DBusCon) InhibitShutdown() (InhibitLock, error) {
 	return InhibitLock(fd), nil
 }
 
+func (bus *DBusCon) BlockShutdown() (InhibitLock, error) {
+	obj := bus.SystemBus.Object(logindService, logindObject)
+	what := "shutdown"
+	who := "kubelet"
+	why := "Kubelet blocks shutdown until all leases have been released"
+	mode := "block"
+
+	call := obj.Call("org.freedesktop.login1.Manager.Inhibit", 0, what, who, why, mode)
+	if call.Err != nil {
+		return InhibitLock(0), fmt.Errorf("failed creating systemd inhibitor: %w", call.Err)
+	}
+
+	var fd uint32
+	err := call.Store(&fd)
+	if err != nil {
+		return InhibitLock(0), fmt.Errorf("failed storing inhibit lock file descriptor: %w", err)
+	}
+
+	return InhibitLock(fd), nil
+}
+
 // ReleaseInhibitLock will release the underlying inhibit lock which will cause the shutdown to start.
 func (bus *DBusCon) ReleaseInhibitLock(lock InhibitLock) error {
 	err := syscall.Close(int(lock))

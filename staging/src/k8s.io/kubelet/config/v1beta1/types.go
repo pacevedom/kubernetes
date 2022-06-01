@@ -1072,6 +1072,11 @@ type KubeletConfiguration struct {
 	// Default: true
 	// +optional
 	RegisterNode *bool `json:"registerNode,omitempty"`
+	// shutdownInhibitorAlertTimeout TODO
+	// Default: "0s"
+	// +featureGate=ShutdownInhibitor
+	// +optional
+	ShutdownInhibitorAlertTimeout metav1.Duration `json:"shutdownInhibitorAlertTimeout,omitempty"`
 }
 
 type KubeletAuthorizationMode string
