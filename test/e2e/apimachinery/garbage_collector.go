@@ -760,7 +760,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 			if err != nil {
 				return false, fmt.Errorf("failed to get rc: %v", err)
 			}
-			if rc1.Status.Replicas == *rc1.Spec.Replicas {
+			if rc1.Status.AvailableReplicas == *rc1.Spec.Replicas {
 				return true, nil
 			}
 			return false, nil
